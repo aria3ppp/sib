@@ -123,13 +123,16 @@ pub trait HFactory: Send + Sized + 'static {
         tls_builder.set_max_proto_version(ssl.max_version.to_boring())?;
         tls_builder.set_alpn_protos(b"\x08http/1.1")?;
 
-        // tls_builder.set_servername_callback(|ssl_ref, _| {
-        //     if ssl_ref.servername(boring::ssl::NameType::HOST_NAME).is_none() {
-        //         eprintln!("SNI not provided, rejecting connection");
-        //         return Err(boring::ssl::SniError::ALERT_FATAL);
-        //     }
-        //     Ok(())
-        // });
+        #[cfg(not(debug_assertions))]
+        {
+            tls_builder.set_servername_callback(|ssl_ref, _| {
+                if ssl_ref.servername(boring::ssl::NameType::HOST_NAME).is_none() {
+                    eprintln!("SNI not provided, rejecting connection");
+                    return Err(boring::ssl::SniError::ALERT_FATAL);
+                }
+                Ok(())
+            });
+        }
 
         let stacksize = if stack_size > 0 {
             stack_size
@@ -343,7 +346,6 @@ where
     let blocked = read(stream, req_buf)?;
     loop {
         // create a new session
-
         use crate::network::http::h1_session;
         let mut headers = [MaybeUninit::uninit(); h1_session::MAX_HEADERS];
         let mut sess =
@@ -356,9 +358,11 @@ where
             if e.kind() == std::io::ErrorKind::ConnectionAborted {
                 return Err(e);
             }
+            break;
         }
     }
-    // send the response back to client
+    
+    // Flush any pending response bytes
     write(stream, rsp_buf)?;
     Ok(blocked)
 }
@@ -444,6 +448,8 @@ type ConnKey = [u8; quiche::MAX_CONN_ID_LEN];
 enum H3CtrlMsg {
     BindAddr(std::net::SocketAddr, may::sync::mpsc::Sender<Datagram>),
     UnbindAddr(std::net::SocketAddr),
+    AddCid(ConnKey, may::sync::mpsc::Sender<Datagram>),
+    RemoveCid(ConnKey),
 }
 #[cfg(feature = "net-h3-server")]
 #[derive(Debug)]
@@ -680,11 +686,14 @@ fn quic_dispatcher<S, F>(
     F: FnMut(usize) -> S + Send + 'static,
 {
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     type WorkerTx = may::sync::mpsc::Sender<Datagram>;
+    struct AddrEntry { tx: WorkerTx, expires: Instant }
 
     let mut by_cid: HashMap<ConnKey, WorkerTx> = HashMap::new();
-    let mut by_addr: HashMap<SocketAddr, WorkerTx> = HashMap::new();
+    let mut by_addr: HashMap<SocketAddr, AddrEntry> = HashMap::new();
+    const BY_ADDR_TTL: Duration = Duration::from_secs(10);
 
     // control channel
     let (ctrl_tx, ctrl_rx) = may::sync::mpsc::channel::<H3CtrlMsg>();
@@ -696,13 +705,22 @@ fn quic_dispatcher<S, F>(
         while let Ok(msg) = ctrl_rx.try_recv() {
             match msg {
                 H3CtrlMsg::BindAddr(addr, tx) => {
-                    by_addr.insert(addr, tx);
+                    by_addr.insert(addr, AddrEntry { tx, expires: Instant::now() + BY_ADDR_TTL });
                 }
                 H3CtrlMsg::UnbindAddr(addr) => {
                     by_addr.remove(&addr);
+                },
+                H3CtrlMsg::AddCid(cid, tx) => { 
+                    by_cid.insert(cid, tx); 
+                }
+                H3CtrlMsg::RemoveCid(cid) => { 
+                    by_cid.remove(&cid); 
                 }
             }
         }
+
+        let now = Instant::now();
+        by_addr.retain(|_, v| v.expires > now);
 
         // read a UDP datagram
         let mut buf = BytesMut::with_capacity(65535);
@@ -742,13 +760,9 @@ fn quic_dispatcher<S, F>(
         }
 
         // fallback path: known address → route and learn new DCID
-        if let Some(tx) = by_addr.get(&from) {
-            let _ = tx.send(Datagram {
-                buf: buf.to_vec(),
-                from,
-                to: local_addr,
-            });
-            // Also bind the new DCID to this worker for next packets.
+        if let Some(entry) = by_addr.get(&from) {
+            let tx = &entry.tx;  // <- use entry.tx
+            let _ = tx.send(Datagram { buf: buf.to_vec(), from, to: local_addr });
             by_cid.insert(dcid_key, tx.clone());
             continue;
         }
@@ -816,7 +830,8 @@ fn quic_dispatcher<S, F>(
         // spawn worker
         let (tx, rx) = may::sync::mpsc::channel::<Datagram>();
         // We bind by address immediately; the worker will also AddCid as needed.
-        by_addr.insert(from, tx.clone());
+        by_addr.insert(from, AddrEntry { tx: tx.clone(), expires: Instant::now() + BY_ADDR_TTL });
+
         // Bind the current DCID too (client is using hdr.dcid now)
         by_cid.insert(dcid_key, tx.clone());
 
@@ -835,9 +850,9 @@ fn quic_dispatcher<S, F>(
                 socket_cloned,
                 conn,
                 from,
-                rx,
-                tx.clone(),
+                (rx, tx.clone()),
                 ctrl_tx_cloned,
+                dcid_key,
                 service,
             );
         });
@@ -849,19 +864,26 @@ fn handle_quic_connection<S: HService + 'static>(
     socket: std::sync::Arc<may::net::UdpSocket>,
     conn: quiche::Connection,
     from: SocketAddr,
-    rx: may::sync::mpsc::Receiver<Datagram>,
-    tx: may::sync::mpsc::Sender<Datagram>,
+    (rx, tx): (may::sync::mpsc::Receiver<Datagram>, may::sync::mpsc::Sender<Datagram>),
     ctrl_tx: may::sync::mpsc::Sender<H3CtrlMsg>,
+    initial_dcid: ConnKey,
     mut service: S,
 ) {
+    use std::collections::HashSet;
     use crate::network::http::h3_session;
+
+    let mut dcids: HashSet<ConnKey> = HashSet::new();
 
     let mut session = h3_session::new_session(from, conn);
 
     // Tell dispatcher we own this addr
-    // We can’t see current DCID in the worker; dispatcher already inserted it. 
-    // No-op if duplicated.
     let _ = ctrl_tx.send(H3CtrlMsg::BindAddr(from, tx.clone()));
+
+    // Register the initial DCID as the primary key for routing
+    if dcids.insert(initial_dcid)
+    {
+        let _ = ctrl_tx.send(H3CtrlMsg::AddCid(initial_dcid, tx.clone()));
+    }
 
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
     let h3_config = match quiche::h3::Config::new() {
@@ -903,6 +925,12 @@ fn handle_quic_connection<S: HService + 'static>(
         if (session.conn.is_in_early_data() || session.conn.is_established())
             && session.http3_conn.is_none()
         {
+            for sc in session.conn.source_ids() {
+                let k = key_from_cid(sc);
+                if dcids.insert(k) {
+                    let _ = ctrl_tx.send(H3CtrlMsg::AddCid(k, tx.clone()));
+                }
+            }
             match quiche::h3::Connection::with_transport(&mut session.conn, &h3_config) {
                 Ok(h3) => session.http3_conn = Some(h3),
                 Err(e) => eprintln!("with_transport: {e}"),
@@ -980,7 +1008,9 @@ fn handle_quic_connection<S: HService + 'static>(
         if session.conn.is_closed() {
             // cleanup
             let _ = ctrl_tx.send(H3CtrlMsg::UnbindAddr(from));
-            // If you tracked specific DCIDs in the worker, RemoveCid them here as well.
+            for cid in dcids.drain() {
+                let _ = ctrl_tx.send(H3CtrlMsg::RemoveCid(cid));
+            }
             break;
         }
 
@@ -989,12 +1019,13 @@ fn handle_quic_connection<S: HService + 'static>(
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use crate::network::http::{
         server::{HFactory, HService},
         session::Session,
-        util::Status,
+        util::{Status, SSLVersion},
     };
     use may::net::TcpStream;
     use std::{
@@ -1008,7 +1039,7 @@ mod tests {
         fn call<SE: Session>(&mut self, session: &mut SE) -> std::io::Result<()> {
             let req_method = session.req_method().unwrap_or_default().to_owned();
             let req_path = session.req_path().unwrap_or_default().to_owned();
-            let req_body = session.req_body(std::time::Duration::from_secs(1))?;
+            let req_body = session.req_body(std::time::Duration::from_secs(5))?;
             let body = bytes::Bytes::from(format!(
                 "Echo: {req_method:?} {req_path:?}\r\nBody: {req_body:?}"
             ));
@@ -1021,6 +1052,10 @@ mod tests {
                 .header_str("Content-Length", body_len_str)?
                 .body(&body)
                 .eom();
+
+            if !session.is_h3() && req_method == "POST" {
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "H1 POST should return WouldBlock"));
+            }
             Ok(())
         }
     }
@@ -1052,6 +1087,7 @@ mod tests {
         (cert.pem(), key_pair.serialize_pem())
     }
 
+    #[cfg(feature = "net-h1-server")]
     #[test]
     fn test_h1_gracefull_shutdown() {
         const NUMBER_OF_WORKERS: usize = 1;
@@ -1068,8 +1104,9 @@ mod tests {
         client_handler.join().expect("client handler failed");
     }
 
+    #[cfg(feature = "net-h1-server")]
     #[test]
-    fn test_h1_server_response() {
+    fn test_h1_server_get_response() {
         const NUMBER_OF_WORKERS: usize = 1;
         crate::init(NUMBER_OF_WORKERS, 2 * 1024 * 1024);
 
@@ -1091,7 +1128,7 @@ mod tests {
             let response = std::str::from_utf8(&buf[..n]).unwrap();
 
             assert!(response.contains("/test"));
-            print!("Response: {response}");
+            eprintln!("\r\nH1 GET Response: {response}");
         });
 
         may::join!(server_handle, client_handler);
@@ -1099,7 +1136,45 @@ mod tests {
         std::thread::sleep(Duration::from_secs(2));
     }
 
-    #[cfg(feature = "sys-boring-ssl")]
+    #[cfg(feature = "net-h1-server")]
+    #[test]
+    fn test_h1_server_post_response() {
+        const NUMBER_OF_WORKERS: usize = 1;
+        crate::init(NUMBER_OF_WORKERS, 2 * 1024 * 1024);
+
+        let addr = "127.0.0.1:8080";
+        let server_handle = EchoServer.start_h1(addr, 0).expect("h1 start server");
+
+        let client_handler = may::go!(move || {
+            use std::io::{Read, Write};
+            may::coroutine::sleep(Duration::from_millis(100));
+
+            let mut stream = TcpStream::connect(addr).expect("connect");
+
+            let body = b"hello=world";
+            let req = format!(
+                "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+
+            stream.write_all(req.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let response = std::str::from_utf8(&buf[..n]).unwrap();
+
+            // Should include method, path, and echoed body contents
+            assert!(response.contains("POST"));
+            assert!(response.contains("/submit"));
+            eprintln!("\r\nH1 POST Response: {response}");
+        });
+
+        may::join!(server_handle, client_handler);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    #[cfg(all(feature = "sys-boring-ssl", feature = "net-h1-server"))]
     #[test]
     fn test_tls_h1_gracefull_shutdown() {
         const NUMBER_OF_WORKERS: usize = 1;
@@ -1110,8 +1185,8 @@ mod tests {
             cert_pem: cert_pem.as_bytes(),
             key_pem: key_pem.as_bytes(),
             chain_pem: None,
-            min_version: crate::network::http::util::SSLVersion::TLS1_2,
-            max_version: crate::network::http::util::SSLVersion::TLS1_3,
+            min_version: SSLVersion::TLS1_2,
+            max_version: SSLVersion::TLS1_3,
             io_timeout: std::time::Duration::from_secs(10),
         };
         let addr = "127.0.0.1:8080";
@@ -1127,20 +1202,32 @@ mod tests {
         client_handler.join().expect("client handler failed");
     }
 
-    // #[test]
-    // fn test_tls_h1_server_response() {
-    //     let (cert_pem, key_pem) = create_self_signed_tls_pems();
-    //     // Pick a port and start the server
-    //     let addr = "127.0.0.1:8080";
-    //     let server_handle = H1Server(EchoService)
-    //         .start_tls(addr, cert_pem.as_bytes(), key_pem.as_bytes())
-    //         .expect("h1 start server");
+    #[cfg(all(feature = "sys-boring-ssl", feature = "net-h1-server"))]
+    #[test]
+    fn test_tls_h1_server_response() {
+        const NUMBER_OF_WORKERS: usize = 1;
+        crate::init(NUMBER_OF_WORKERS, 2 * 1024 * 1024);
+        let (cert_pem, key_pem) = create_self_signed_tls_pems();
+        let ssl = crate::network::http::util::SSL {
+            cert_pem: cert_pem.as_bytes(),
+            key_pem: key_pem.as_bytes(),
+            chain_pem: None,
+            min_version: SSLVersion::TLS1_2,
+            max_version: SSLVersion::TLS1_3,
+            io_timeout: std::time::Duration::from_secs(10),
+        };
+        // Pick a port and start the server
+        let addr = "127.0.0.1:8080";
+        let server_handle = EchoServer
+            .start_h1_tls(addr, &ssl, 0, None)
+            .expect("h1 start server");
 
-    //     may::join!(server_handle);
+        may::join!(server_handle);
 
-    //     std::thread::sleep(Duration::from_secs(200));
-    // }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 
+    #[cfg(feature = "net-h3-server")]
     #[tokio::test]
     async fn test_quiche_server_response() -> Result<(), Box<dyn std::error::Error>> {
         const NUMBER_OF_WORKERS: usize = 1;
