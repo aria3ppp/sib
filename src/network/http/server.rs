@@ -720,6 +720,11 @@ pub trait HFactory: Send + Sync + Sized + 'static {
                                         Ok(p) => p,
                                         Err(_) => {
                                             let _ = stream.shutdown().await;
+                                            ///////////////////////////////////////////////////////////////////////////
+                                            // {
+                                            println!("[SIB] 725");
+                                            // }
+                                            ///////////////////////////////////////////////////////////////////////////
                                             continue;
                                         }
                                     };
@@ -736,6 +741,11 @@ pub trait HFactory: Send + Sync + Sized + 'static {
                                         let tls_stream = match tls_acceptor.accept(stream).await {
                                             Ok(s) => s,
                                             Err(e) => {
+                                                ///////////////////////////////////////////////////////////////////////////
+                                                // {
+                                                println!("[SIB] 746");
+                                                // }
+                                                ///////////////////////////////////////////////////////////////////////////
                                                 eprintln!(
                                                     "TLS handshake error (shard {shard_id}) from {peer_addr}: {e}"
                                                 );
@@ -752,6 +762,11 @@ pub trait HFactory: Send + Sync + Sized + 'static {
 
                                         match negotiated.as_deref() {
                                             Some("h2") => {
+                                                ///////////////////////////////////////////////////////////////////////////
+                                                // {
+                                                println!("[SIB] handle h2");
+                                                // }
+                                                ///////////////////////////////////////////////////////////////////////////
                                                 use crate::network::http::h2_server::serve_h2;
 
                                                 let service = factory.async_service(shard_id);
@@ -759,12 +774,22 @@ pub trait HFactory: Send + Sync + Sized + 'static {
                                                 if let Err(e) =
                                                     serve_h2(tls_stream, service, &h2_cfg_cloned, peer_ip).await  
                                                     && !(*is_tls_eof_no_close_notify)(&e) {
+                                                        ///////////////////////////////////////////////////////////////////////////
+                                                        // {
+                                                        println!("[SIB] 779");
+                                                        // }
+                                                        ///////////////////////////////////////////////////////////////////////////
                                                         eprintln!(
                                                             "h2 serve error (shard {shard_id}) from {peer_addr}: {e}"
                                                         );
                                                 }
                                             }
                                             _ => {
+                                                ///////////////////////////////////////////////////////////////////////////
+                                                // {
+                                                println!("[SIB] handle h2 or no-protocol");
+                                                // }
+                                                ///////////////////////////////////////////////////////////////////////////
                                                 use crate::network::http::h2_server::serve_h1;
 
                                                 let service = factory.async_service(shard_id);
@@ -772,6 +797,11 @@ pub trait HFactory: Send + Sync + Sized + 'static {
                                                 if let Err(e) =
                                                     serve_h1(tls_stream, service, &h2_cfg_cloned, peer_ip).await
                                                     && !(*is_tls_eof_no_close_notify)(&e) {
+                                                        ///////////////////////////////////////////////////////////////////////////
+                                                        // {
+                                                        println!("[SIB] 802");
+                                                        // }
+                                                        ///////////////////////////////////////////////////////////////////////////
                                                         eprintln!(
                                                             "h1 fallback serve error (shard {shard_id}) from {peer_addr}: {e}"
                                                         );

@@ -244,6 +244,11 @@ cfg_if::cfg_if! {
                 loop {
                     let n = stream.read(&mut buf[read..]).await?;
                     if n == 0 {
+                        ///////////////////////////////////////////////////////////////////////////
+                        // {
+                        println!("[SIB] [H1] calling 249");
+                        // }
+                        ///////////////////////////////////////////////////////////////////////////
                         return Ok(());
                     }
                     read += n;
@@ -261,11 +266,23 @@ cfg_if::cfg_if! {
                 let mut req = httparse::Request::new(&mut headers);
                 let status = req
                     .parse(&buf[..read])
-                    .map_err(|e| std::io::Error::other(format!("httparse error: {e}")))?;
+                    .map_err(|e| {
+                        ///////////////////////////////////////////////////////////////////////////
+                        // {
+                        println!("[SIB] [H1] calling 272");
+                        // }
+                        ///////////////////////////////////////////////////////////////////////////
+                        std::io::Error::other(format!("httparse error: {e}"))
+                    })?;
 
                 let header_len = match status {
                     httparse::Status::Complete(len) => len,
                     httparse::Status::Partial => {
+                        ///////////////////////////////////////////////////////////////////////////
+                        // {
+                        println!("[SIB] [H1] calling 283");
+                        // }
+                        ///////////////////////////////////////////////////////////////////////////
                         return Err(std::io::Error::other("partial HTTP request"));
                     }
                 };
@@ -288,8 +305,22 @@ cfg_if::cfg_if! {
                 let mut req_headers = HeaderMap::new();
                 for h in req.headers.iter() {
                     let name =
-                        HeaderName::from_bytes(h.name.as_bytes()).map_err(std::io::Error::other)?;
-                    let value = HeaderValue::from_bytes(h.value).map_err(std::io::Error::other)?;
+                        HeaderName::from_bytes(h.name.as_bytes()).map_err(|err|{
+                            ///////////////////////////////////////////////////////////////////////////
+                            // {
+                            println!("[SIB] [H1] calling 311");
+                            // }
+                            ///////////////////////////////////////////////////////////////////////////
+                            std::io::Error::other(err)
+                        })?;
+                    let value = HeaderValue::from_bytes(h.value).map_err(|err|{
+                        ///////////////////////////////////////////////////////////////////////////
+                        // {
+                        println!("[SIB] [H1] calling 319");
+                        // }
+                        ///////////////////////////////////////////////////////////////////////////
+                        std::io::Error::other(err)
+                    })?;
                     req_headers.append(name, value);
                 }
 
@@ -301,6 +332,11 @@ cfg_if::cfg_if! {
                     .unwrap_or(0);
 
                 if content_length > config.max_frame_size as usize {
+                    ///////////////////////////////////////////////////////////////////////////
+                    // {
+                    println!("[SIB] [H1] calling 337");
+                    // }
+                    ///////////////////////////////////////////////////////////////////////////
                     return Err(std::io::Error::other(
                         "content-length exceeds max frame size or is zero",
                     ));
@@ -343,9 +379,15 @@ cfg_if::cfg_if! {
                     keep_alive,
                 );
 
+                ///////////////////////////////////////////////////////////////////////////
+                // {
+                println!("[SIB] [H1] calling podverse handler");
+                // }
+                ///////////////////////////////////////////////////////////////////////////
+
                 use crate::network::http::session::Session;
                 if let Err(e) = service.call(&mut session).await {
-                    eprintln!("h1 service error: {e}");
+                    eprintln!("[SIB] [H1] h1 service error: {e}");
                     if !session.response_sent() {
                         let _ = session
                             .status_code(http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -386,6 +428,11 @@ cfg_if::cfg_if! {
 
             // Handshake H2 connection
             let mut conn = builder.handshake(stream).await.map_err(|e| {
+                ///////////////////////////////////////////////////////////////////////////
+                // {
+                println!("[SIB] [H2] 391");
+                // }
+                ///////////////////////////////////////////////////////////////////////////
                 std::io::Error::other(format!("h2 handshake error: {e}"))
             })?;
 
@@ -409,6 +456,12 @@ cfg_if::cfg_if! {
                                 tokio::task::yield_now().await;
                             };
 
+                            ///////////////////////////////////////////////////////////////////////////
+                            // {
+                            println!("[SIB] [H2] calling podverse service handler");
+                            // }
+                            ///////////////////////////////////////////////////////////////////////////
+
                             let result = service
                                 .call(&mut H2Session::new(peer_addr, request, respond))
                                 .await;
@@ -416,12 +469,12 @@ cfg_if::cfg_if! {
                             *svc_rc.borrow_mut() = Some(service);
 
                             if let Err(e) = result {
-                                eprintln!("h2 service error: {e}");
+                                eprintln!("[SIB] [H2] h2 service error: {e}");
                             }
                         });
                     }
                     Some(Err(e)) => {
-                        eprintln!("accept stream error from {peer_addr}: {e}");
+                        eprintln!("[SIB] [H2] accept stream error from {peer_addr}: {e}");
                         break;
                     }
                     None => break, // connection closed
