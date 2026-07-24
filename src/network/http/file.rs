@@ -1189,18 +1189,11 @@ async fn compress_then_respond_async(
         .await
         .map_err(|e| std::io::Error::other(format!("spawn_blocking join error: {e}")))?;
 
-    #[cfg(all(
-        not(feature = "rt-tokio"),
-        feature = "rt-glommio",
-        target_os = "linux"
-    ))]
+    #[cfg(all(not(feature = "rt-tokio"), feature = "rt-glommio", target_os = "linux"))]
     let res = compress_file_blocking(&path, compress_fn);
 
     // No async runtime to offload to: compress inline on the driving thread.
-    #[cfg(not(any(
-        feature = "rt-tokio",
-        all(feature = "rt-glommio", target_os = "linux")
-    )))]
+    #[cfg(not(any(feature = "rt-tokio", all(feature = "rt-glommio", target_os = "linux"))))]
     let res = compress_file_blocking(&path, compress_fn);
 
     apply_compressed_headers(
